@@ -1,0 +1,7 @@
+{
+  "cognitoUserPoolId": "REPLACE_WITH_USER_POOL_ID",
+  "cognitoClientId": "REPLACE_WITH_USER_POOL_CLIENT_ID",
+  "cognitoDomain": "https://items-lambda-app.auth.eu-central-1.amazoncognito.com",
+  "region": "eu-central-1",
+  "apiBaseUrl": "https://REPLACE_WITH_API_ID.execute-api.eu-central-1.amazonaws.com/api"
+}
