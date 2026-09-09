@@ -19,14 +19,17 @@ const SEED_ITEMS: Array<{ id: number; name: string; description: string }> = [
 ];
 
 export class DataStack extends cdk.Stack {
+  // Used by Infra app entry when deploying and wiring props and deps between other stacks.
   public readonly itemsTable: dynamodb.Table;
 
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
     super(scope, id, props);
 
-    // On-demand billing: no capacity to plan for a sample with 8 rows and
-    // near-zero traffic. Compare to the Fargate sample's RDS instance,
+    // On-demand billing: no capacity to plan for a sample with 8 rows and near-zero traffic.
+    // Compare to the Fargate sample's RDS instance,
     // which bills a fixed hourly rate whether or not anyone hits it.
+    // No VPC - because DynamoDB is a fully managed by AWS over the public AWS API (HTTPS),
+    // not a self-managed database server like RDS.
     this.itemsTable = new dynamodb.Table(this, 'ItemsTable', {
       tableName: TABLE_NAME,
       partitionKey: { name: 'id', type: dynamodb.AttributeType.NUMBER },
@@ -34,13 +37,9 @@ export class DataStack extends cdk.Stack {
       removalPolicy: cdk.RemovalPolicy.DESTROY,
     });
 
-    // AWS: the Fargate sample's V2__seed_items.sql Flyway migration has no
-    // DynamoDB equivalent -- Flyway versions relational schemas, not NoSQL
-    // tables. An AwsCustomResource issuing one BatchWriteItem call on stack
-    // creation is the standard CDK substitute for one-time seed data. It
-    // runs onCreate only (not on every deploy), so editing SEED_ITEMS after
-    // the table already exists has no effect -- destroy and recreate
-    // DataStack (or add a migration Lambda) to reseed.
+    // No SpringBoot's Flyway for DynamoDB (NoSQL) -- BatchWriteItem via AwsCustomResource is the CDK substitute.
+    // Runs onCreate only: editing SEED_ITEMS later has no effect until DataStack is destroyed/recreated
+    // (or a migration Lambda is added).
     const createdAt = new Date().toISOString();
     new cr.AwsCustomResource(this, 'SeedItems', {
       onCreate: {
@@ -65,6 +64,7 @@ export class DataStack extends cdk.Stack {
       policy: cr.AwsCustomResourcePolicy.fromSdkCalls({ resources: [this.itemsTable.tableArn] }),
     });
 
+    // If you execute stacks directly with cdk deploy, you can see these outputs in the console (like info return messages).
     new cdk.CfnOutput(this, 'TableName', { value: this.itemsTable.tableName });
   }
 }

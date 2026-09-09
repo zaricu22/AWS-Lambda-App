@@ -1,4 +1,20 @@
-# Angular + AWS Lambda + DynamoDB Sample
+# Angular + AWS Lambda + DynamoDB + AWS CDK Sample (Lambda+DynamoDB+API Gateway+no VPC)
+
+## Implemented cloud concepts
+
+- **S3** — both `FrontendStack`s (`siteBucket`, blocked public access + OAC)
+- **CDN/Edge caching** — CloudFront in both, with S3 + backend (ALB vs HTTP API) as dual origins, `CACHING_OPTIMIZED` vs `CACHING_DISABLED`
+- **Lambda** — `AWS-Lambda-App/infra/lib/backend-stack.ts` (Java 17, ARM_64/Graviton)
+- **EC2 / Fargate contrast** — `AWS-Fargate-App`'s `ApplicationLoadBalancedFargateService` (Fargate, no EC2 management) vs this project's zero-server model
+- **RDS** — `AWS-Fargate-App`'s `DataStack` (Postgres, isolated subnet, Secrets Manager-generated creds)
+- **DynamoDB** — this repo's `DataStack` (PAY_PER_REQUEST, no VPC needed — fully managed over public API)
+- **VPC** — `AWS-Fargate-App` only (public+isolated subnets, no NAT); this app has none, illustrating that DynamoDB doesn't need a VPC
+- **ALB** — `AWS-Fargate-App` (`ApplicationLoadBalancedFargateService`)
+- **API Gateway** — this repo (`HttpApi` + Cognito JWT authorizer at the gateway, contrasted against the Fargate app's in-app `SecurityConfig` check)
+- **IAM / Zero-Trust identity** — Cognito User Pools + JWT auth in both; scoped grants (`grantReadData`, custom-resource policy) here
+- **Secrets Management** — `AWS-Fargate-App` (`ecs.Secret.fromSecretsManager` for DB creds)
+- **Custom silicon (Graviton)** — both: `Architecture.ARM_64` Lambda here, `BURSTABLE4_GRAVITON` RDS instance there
+- **CDK as IaC** (imperative, TS, compiles to CloudFormation) — the entire `infra/` of both
 
 A minimal reference system with exactly two features: **login** and a **read-only items list** pulled from DynamoDB.
 This is the serverless sibling of `AWS-Sample-App` (Fargate + RDS Postgres) — same product, same frontend, deliberately different backend architecture so the two can be compared directly.
@@ -83,6 +99,11 @@ A different tier skips that split entirely — fully managed, high-level service
 - **AWS Lambda** — can also deploy from a Docker container image in ECR, not just a zip; suited to event-driven APIs, background data processing, or ML model inference jobs.
 
 This project uses Lambda from this fully-managed tier, in contrast to the AWS-Fargate-App sample's ECS+Fargate choice from the orchestration+compute tier.
+
+### CORS: needed locally, not in production
+
+- **Production**: CloudFront fronts both the frontend (S3) and backend (`/api/*` routed to the HTTP API) as behaviors on one distribution (`frontend-stack.ts`) — to the browser it's a single origin, so no CORS preflight ever happens.
+- **Local dev**: there's no local Lambda/API Gateway emulator (see the comparison table below), so local frontend dev calls the *real, deployed* HTTP API directly from `localhost:4200` — genuinely cross-origin. `backend-stack.ts`'s `HttpApi` therefore always configures `corsPreflight` for `http://localhost:4200`, even though production traffic never uses it.
 
 ### Why Lambda + DynamoDB, and what's actually different from the AWS-Fargate-App sample
 
@@ -259,6 +280,16 @@ There is no local backend to run (no Postgres, no `mvn spring-boot:run` equivale
    npm start
    ```
    Visit `http://localhost:4200`, log in with the demo user via either path, and confirm the items list loads.
+
+### Why there's no `docker-samples/`-style all-in-one local stack here
+
+The AWS-Fargate-App sibling has a `docker-samples/` folder that runs its whole stack (Postgres + backend + frontend) with one `docker compose up`, as an alternative to running each piece as a separate local process. That doesn't carry over to this sample:
+
+- **Fargate's backend is a long-running HTTP server** — a JVM process listening on a port, trivially containerized and driven with normal `GET`/`POST` requests, same shape as production.
+- **This sample's backend is a Lambda function**, invoked by API Gateway. The closest local equivalent is the AWS Lambda Runtime Interface Emulator (RIE), but it exposes a raw `/2015-03-31/functions/function/invocations` invoke endpoint — not a normal `GET /api/items` route — so the frontend couldn't call it directly without a shim reproducing API Gateway's routing.
+- **Cognito JWT validation happens at API Gateway's `HttpUserPoolAuthorizer`, not in the Lambda.** `ItemsHandler` does zero auth checking itself (by design — see `infra/lib/backend-stack.ts`). A local container running just the Lambda would either skip auth entirely or need a second component reimplementing the authorizer, which is real added complexity rather than a Dockerfile exercise.
+
+DynamoDB itself *does* have a real official local image (`amazon/dynamodb-local`), so half of this stack is containerizable — it's specifically the Lambda + API Gateway + authorizer combination that has no faithful one-command local equivalent. This is the same point the "Local development" section above and the comparison table below make: **no local emulator** is a deliberate, load-bearing contrast between this sample and the Fargate one, not a gap to fill in.
 
 ## Full deploy
 

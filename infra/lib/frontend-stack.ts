@@ -24,17 +24,19 @@ export class FrontendStack extends cdk.Stack {
       autoDeleteObjects: true,
     });
 
+    // AWS's CDN (CloudFront): public HTTPS endpoint browsers actually hit — it does not serve files itself;
+    // it's a routing/caching layer that pulls content from one or more origins
+    // (S3 buckets, HTTP APIs, ALBs, etc.) and caches/serves it to users.
+    // Because the frontend bucket and backend HTTP API sit behind the same distribution, no CORS policy is needed in prod.
     const distribution = new cloudfront.Distribution(this, 'Distribution', {
+      // Frontend Bucket route:
       defaultRootObject: 'index.html',
       defaultBehavior: {
         origin: origins.S3BucketOrigin.withOriginAccessControl(siteBucket),
         viewerProtocolPolicy: cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
         cachePolicy: cloudfront.CachePolicy.CACHING_OPTIMIZED,
       },
-      // Routes /api/* to the HTTP API through the SAME distribution, so the
-      // Angular app's API calls are same-origin -> no CORS needed in prod.
-      // Unlike the Fargate sample's ALB origin (plain-HTTP CloudFront->ALB
-      // hop), API Gateway is HTTPS-only end to end.
+      // Backend HTTP API route:
       additionalBehaviors: {
         '/api/*': {
           origin: new origins.HttpOrigin(`${props.httpApi.apiId}.execute-api.${this.region}.amazonaws.com`, {
@@ -46,8 +48,9 @@ export class FrontendStack extends cdk.Stack {
           allowedMethods: cloudfront.AllowedMethods.ALLOW_ALL,
         },
       },
-      // SPA deep-link/refresh fix: unknown paths (client-side routes) fall
-      // back to index.html instead of a raw S3 404.
+      // SiteS3Bucket doesn't allow public or direct access to its containing resources,
+      // also S3/CloudFront doesn't know anything about Angular's routes,
+      // so in case of violation we should transfer raw S3 404 to index.html.
       errorResponses: [
         { httpStatus: 403, responseHttpStatus: 200, responsePagePath: '/index.html' },
         { httpStatus: 404, responseHttpStatus: 200, responsePagePath: '/index.html' },
@@ -95,6 +98,7 @@ export class FrontendStack extends cdk.Stack {
       prune: false,
     });
 
+    // If you execute stacks directly with cdk deploy, you can see these outputs in the console (like info return messages).
     new cdk.CfnOutput(this, 'SiteUrl', { value: `https://${distribution.distributionDomainName}` });
   }
 }

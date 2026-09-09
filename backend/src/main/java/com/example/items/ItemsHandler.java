@@ -16,20 +16,24 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * AWS: DynamoDbClient and ObjectMapper are created once per execution
- * environment (static fields, not per-invocation) so warm invocations reuse
- * them -- the Lambda analogue of the Fargate sample's long-lived JDBC pool,
+ * AWS: DynamoDbClient and ObjectMapper are created once per execution environment
+ * (static fields, not per-invocation) so warm invocations reuse them.
+ * The Lambda analogue of the Fargate sample's long-lived JDBC pool,
  * minus a pool itself since DynamoDB has no connections to hold open.
  *
- * API Gateway's HttpUserPoolAuthorizer (see infra/lib/backend-stack.ts)
- * already validated the caller's Cognito JWT before this handler ever
- * runs, so unlike the Fargate sample's SecurityConfig/CognitoClientIdValidator,
- * there is no token validation code here at all.
+ * API Gateway's (analogue to Fargate sample's LoadBalancer):
+ * HttpUserPoolAuthorizer (backend-stack) already validated the caller's Cognito JWT
+ * before this handler ever runs, so unlike the Fargate sample's SecurityConfig/CognitoClientIdValidator,
+ * there is no token validation code here in Java app at all.
+ *
+ * Request mapping (/api/items) is done by AWS API Gateway, defined in apigwv2.HttpApi routes (backend-stack)
  */
 public class ItemsHandler implements RequestHandler<APIGatewayV2HTTPEvent, APIGatewayV2HTTPResponse> {
 
     private static final DynamoDbClient DDB = DynamoDbClient.create();
     private static final ObjectMapper MAPPER = new ObjectMapper();
+    // TABLE_NAME ← TABLE_NAME env-var on Lambda function (backend-stack)
+    // ← props.itemsTable.tableName ← DataStack.itemsTable ← tableName: TABLE_NAME (data-stack)
     private static final String TABLE_NAME = System.getenv("TABLE_NAME");
 
     @Override

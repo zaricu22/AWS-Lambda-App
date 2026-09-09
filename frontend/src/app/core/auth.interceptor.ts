@@ -3,12 +3,10 @@ import { inject } from '@angular/core';
 import { AuthService } from './auth.service';
 import { ConfigService } from './config.service';
 
-// AWS: apiBaseUrl is '/api' in production, which CloudFront routes to API
-// Gateway -> Lambda (see infra/lib/frontend-stack.ts's '/api/*' behavior) --
-// same origin as the SPA, so no CORS is needed there. In local dev,
-// apiBaseUrl is the deployed API Gateway's own HTTPS URL (there is no local
-// Lambda emulator here), which IS cross-origin from localhost:4200 -- see
-// BackendStack's corsPreflight config.
+/*
+ * AWS: Attaches the Cognito bearer token with every request to the Lambda's API (CloudFront -> API Gateway -> Lambda);
+ * API Gateway's HttpUserPoolAuthorizer validates it before the Lambda ever runs.
+*/
 export const authInterceptor: HttpInterceptorFn = (req, next) => {
   const config = inject(ConfigService);
   const authService = inject(AuthService);

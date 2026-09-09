@@ -10,10 +10,10 @@ export class ItemsService {
   private config = inject(ConfigService);
 
   getItems(): Observable<Item[]> {
-    // AWS: reaches the Lambda's GET /api/items through CloudFront -> API
-    // Gateway -> Lambda in production; authInterceptor attaches the Cognito
-    // bearer token, and API Gateway's HttpUserPoolAuthorizer validates it
-    // before the Lambda ever runs (see infra/lib/backend-stack.ts).
+    /**
+     * AWS: fetches items from the Lambda's GET /api/items through CloudFront -> API Gateway -> Lambda in production; 
+     * authInterceptor attaches the Cognito bearer token, and API Gateway's HttpUserPoolAuthorizer validates it before the Lambda ever runs.
+     */
     return this.http.get<Item[]>(`${this.config.get().apiBaseUrl}/items`);
   }
 }

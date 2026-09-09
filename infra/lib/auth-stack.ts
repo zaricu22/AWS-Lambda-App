@@ -9,6 +9,7 @@ export interface AuthStackProps extends cdk.StackProps {
 }
 
 export class AuthStack extends cdk.Stack {
+  // Used by Infra app entry when deploying and wiring props and deps between other stacks.
   public readonly userPool: cognito.UserPool;
   public readonly userPoolClient: cognito.UserPoolClient;
   public readonly userPoolDomain: cognito.UserPoolDomain;
@@ -17,6 +18,7 @@ export class AuthStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props: AuthStackProps) {
     super(scope, id, props);
 
+    // Needed by Backend-Stack for the HttpUserPoolAuthorizer and by Frontend-Stack for userPoolId -> 'runtime-config.json'
     // Self-signup is intentionally disabled: this sample has no signup feature.
     // Create a demo user manually — see README "Create a demo user".
     this.userPool = new cognito.UserPool(this, 'UserPool', {
@@ -28,10 +30,11 @@ export class AuthStack extends cdk.Stack {
       removalPolicy: cdk.RemovalPolicy.DESTROY,
     });
 
+    // Needed by Backend-Stack for the HttpUserPoolAuthorizer (validates client_id) and by Frontend-Stack for userPoolClientId -> 'runtime-config.json'
     // One secret-less app client serves both login paths:
     //  - userPassword: true    -> custom Angular login form (InitiateAuth USER_PASSWORD_AUTH)
     //  - oAuth.flows.authorizationCodeGrant -> Cognito Hosted UI with PKCE
-    // generateSecret stays false: a browser SPA cannot keep a client secret secret.
+    // generateSecret stays false: a browser SPA cannot keep a client secret.
     this.userPoolClient = new cognito.UserPoolClient(this, 'UserPoolClient', {
       userPool: this.userPool,
       generateSecret: false,
@@ -53,12 +56,16 @@ export class AuthStack extends cdk.Stack {
       preventUserExistenceErrors: true,
     });
 
+    // Needed by Frontend-Stack -> 'runtime-config.json'
     this.userPoolDomain = this.userPool.addDomain('UserPoolDomain', {
       cognitoDomain: { domainPrefix: props.cognitoDomainPrefix },
     });
 
+    // Unlike the Fargate sample, where SpringBoot Security do in-app validation,
+    // API Gateway's HttpUserPoolAuthorizer validates tokens directly against the userPool/userPoolClient constructs.
     this.issuerUri = `https://cognito-idp.${this.region}.amazonaws.com/${this.userPool.userPoolId}`;
 
+    // If you execute stacks directly with cdk deploy, you can see these outputs in the console (like info return messages).
     new cdk.CfnOutput(this, 'UserPoolId', { value: this.userPool.userPoolId });
     new cdk.CfnOutput(this, 'UserPoolClientId', { value: this.userPoolClient.userPoolClientId });
     new cdk.CfnOutput(this, 'CognitoDomain', {

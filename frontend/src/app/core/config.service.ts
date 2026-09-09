@@ -1,7 +1,7 @@
 import { Injectable } from '@angular/core';
 
 // AWS: fetched at bootstrap rather than baked into environment.ts at build
-// time -- CDK doesn't know the Cognito IDs until AuthStack deploys, and
+// time -- CDK doesn't know the Cognito IDs until LambdaAuthStack deploys, and
 // redeploying infra shouldn't force an `ng build`. See infra/lib/frontend-
 // stack.ts, which writes this file's production contents directly from
 // CDK-known values (Cognito user pool/client/domain, region, API base URL).
@@ -18,6 +18,9 @@ export class ConfigService {
   private config?: RuntimeConfig;
 
   async load(): Promise<void> {
+    /*
+      AWS: Frontend's S3Bucket - "SiteBucket" - interface RuntimeConfig above
+    */
     const response = await fetch('/runtime-config.json');
     if (!response.ok) {
       throw new Error(`Failed to load runtime-config.json: ${response.status}`);
@@ -25,6 +28,7 @@ export class ConfigService {
     this.config = (await response.json()) as RuntimeConfig;
   }
 
+  // used by ItemService, AuthService, and AuthInterceptor, to get the runtime configs
   get(): RuntimeConfig {
     if (!this.config) {
       throw new Error('ConfigService.load() must complete before use');

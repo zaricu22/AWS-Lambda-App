@@ -15,16 +15,16 @@ export interface BackendStackProps extends cdk.StackProps {
 }
 
 export class BackendStack extends cdk.Stack {
+  // Used by Infra app entry when deploying and wiring props and deps between other stacks.
   public readonly httpApi: apigwv2.HttpApi;
 
   constructor(scope: Construct, id: string, props: BackendStackProps) {
     super(scope, id, props);
 
-    // AWS: unlike the Fargate sample's ContainerImage.fromAsset (which
-    // builds the Spring Boot image from source at `cdk deploy` time), this
-    // references a pre-built fat jar directly -- there is no Docker
-    // bundling step here. Run `mvn package` in backend/ before deploying
-    // this stack (see README "Build the Lambda jar").
+    // AWS Lambda: unlike the Fargate sample's ContainerImage.fromAsset
+    // (which builds the Spring Boot image from source at `cdk deploy` time),
+    // this references a pre-built fat jar (`mvn package`) directly/locally (../../backend/target/items-lambda.jar).
+    // API Gateway instead of Fargate ALB (App Load Balancer), without /health check possibility.
     const itemsFunction = new lambda.Function(this, 'ItemsFunction', {
       runtime: lambda.Runtime.JAVA_17,
       architecture: lambda.Architecture.ARM_64,
@@ -38,23 +38,15 @@ export class BackendStack extends cdk.Stack {
     });
     props.itemsTable.grantReadData(itemsFunction);
 
-    // AWS: HttpUserPoolAuthorizer validates the Cognito-issued JWT (and
-    // matches Cognito's client_id claim against userPoolClients) directly
-    // at the API Gateway layer, before the Lambda ever runs. Contrast with
-    // the Fargate sample, where Spring Security's OAuth2 resource server
-    // (SecurityConfig.java + CognitoClientIdValidator) does the equivalent
-    // check inside the running app. ItemsHandler itself performs no token
-    // validation -- if it's invoked at all, API Gateway already accepted
-    // the caller's token.
+    // Validates JWT + client_id at the gateway, before the Lambda runs --
+    // unlike the Fargate sample, which checks in-app (SecurityConfig.java).
+    // ItemsHandler itself does no token validation.
     const authorizer = new authorizers.HttpUserPoolAuthorizer('CognitoAuthorizer', props.userPool, {
       userPoolClients: [props.userPoolClient],
     });
 
-    // CORS is needed here because there's no local emulator for this
-    // backend (see CLAUDE.md) -- local dev calls this deployed API Gateway
-    // directly from localhost:4200, which is cross-origin. In production
-    // the SPA calls same-origin '/api/*' through CloudFront (see
-    // FrontendStack), so CORS never applies there.
+    // CORS is needed only for local-dev because it calls this deployed API Gateway
+    // directly from localhost:4200, which is cross-origin.
     this.httpApi = new apigwv2.HttpApi(this, 'HttpApi', {
       corsPreflight: {
         allowOrigins: ['http://localhost:4200'],
@@ -63,6 +55,7 @@ export class BackendStack extends cdk.Stack {
       },
     });
 
+    // Substitute just SpringBoot's controller dispatcher annotation (@RestController/@GetMapping).
     this.httpApi.addRoutes({
       path: '/api/items',
       methods: [apigwv2.HttpMethod.GET],
@@ -70,6 +63,7 @@ export class BackendStack extends cdk.Stack {
       authorizer,
     });
 
+    // If you execute stacks directly with cdk deploy, you can see these outputs in the console (like info return messages).
     new cdk.CfnOutput(this, 'ApiUrl', { value: this.httpApi.apiEndpoint });
   }
 }

@@ -19,6 +19,10 @@ export class ItemsComponent implements OnInit {
   loading = signal(true);
   error = signal<string | null>(null);
 
+  /**
+   * AWS: fetches items from the Lambda's GET /api/items through CloudFront -> API Gateway -> Lambda in production; 
+   * authInterceptor attaches the Cognito bearer token, and API Gateway's HttpUserPoolAuthorizer validates it before the Lambda ever runs.
+   */
   ngOnInit(): void {
     this.itemsService.getItems().subscribe({
       next: (items) => {
@@ -32,6 +36,7 @@ export class ItemsComponent implements OnInit {
     });
   }
 
+  // Remove the user's tokens and redirect to the login page. The guard will then redirect to the login page if the user is not authenticated.
   logout(): void {
     this.authService.logout();
     this.router.navigateByUrl('/login');
