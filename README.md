@@ -1,5 +1,39 @@
 # Angular + AWS Lambda + DynamoDB + AWS CDK Sample (Lambda+DynamoDB+API Gateway+no VPC)
 
+<!-- contents -->
+**Contents**
+
+- [Implemented cloud concepts](#implemented-cloud-concepts)
+- [Theoretical background](#theoretical-background)
+  - [Cloud platforms](#cloud-platforms)
+  - [Infrastructure as Code (IaC)](#infrastructure-as-code-iac)
+- [Architecture](#architecture)
+  - [Why use CDK (Infrastructure as Code)?](#why-use-cdk-infrastructure-as-code)
+  - [Identity & authentication (Cognito)](#identity--authentication-cognito)
+  - [Serverless compute (Lambda)](#serverless-compute-lambda)
+  - [CORS: needed locally, not in production](#cors-needed-locally-not-in-production)
+  - [Why Lambda + DynamoDB, and what's actually different from the AWS-Fargate-App sample](#why-lambda--dynamodb-and-whats-actually-different-from-the-aws-fargate-app-sample)
+  - [Why not Spring Boot on Lambda](#why-not-spring-boot-on-lambda)
+  - [DynamoDB and scalability](#dynamodb-and-scalability)
+  - [Object storage (S3)](#object-storage-s3)
+- [CDK Bootstrap](#cdk-bootstrap)
+  - ["Compiling" the deployment infrastructure](#compiling-the-deployment-infrastructure)
+- [Prerequisites](#prerequisites)
+  - [AWS credentials](#aws-credentials)
+- [Build the Lambda jar](#build-the-lambda-jar)
+- [First-time setup: deploy Cognito, DynamoDB, and the backend](#first-time-setup-deploy-cognito-dynamodb-and-the-backend)
+  - [Create a demo user](#create-a-demo-user)
+- [Local development](#local-development)
+  - [Why there's no `docker-samples/`-style all-in-one local stack here](#why-theres-no-docker-samples-style-all-in-one-local-stack-here)
+- [Full deploy](#full-deploy)
+  - [Wire up the Hosted UI callback for the deployed site](#wire-up-the-hosted-ui-callback-for-the-deployed-site)
+- [End-to-end smoke test](#end-to-end-smoke-test)
+- [Automated E2E tests (Playwright)](#automated-e2e-tests-playwright)
+- [Tear down](#tear-down)
+- [Troubleshooting](#troubleshooting)
+- [Further reading](#further-reading)
+<!-- /contents -->
+
 ## Implemented cloud concepts
 
 - **S3** — both `FrontendStack`s (`siteBucket`, blocked public access + OAC)
@@ -49,8 +83,9 @@ The general shift this project follows: from manual web-console clicking to vers
 | **Declarative** (DSL) | Terraform (HCL) | CloudFormation (YAML/JSON) |
 | **Programming languages** (imperative) | Pulumi (TS, Python, Go) | **AWS CDK** (TS, Python, Java, ... — compiles to CloudFormation) |
 
-This project sits in the bottom-right cell: AWS CDK, cloud-native and imperative.
-See "Why use CDK" below for what that trade-off actually buys you.
+> [!NOTE]
+> This project sits in the bottom-right cell: AWS CDK, cloud-native and imperative.
+> See "Why use CDK" below for what that trade-off actually buys you.
 
 #### How IaC tools actually deploy
 
@@ -64,9 +99,10 @@ The difference is *who* makes those API calls:
 
 #### What "multi-cloud" actually means
 
-"Multi-cloud" means one tool and one workflow with many providers.
-It does not mean one piece of code that runs on every cloud.
-A provider is a plugin that knows one cloud's API, and resources stay cloud-specific (Terraform's `aws_s3_bucket` vs `google_storage_bucket`).
+> [!WARNING]
+> "Multi-cloud" means one tool and one workflow with many providers.
+> It does not mean one piece of code that runs on every cloud.
+> A provider is a plugin that knows one cloud's API, and resources stay cloud-specific (Terraform's `aws_s3_bucket` vs `google_storage_bucket`).
 
 #### Is there a universal, Liquibase-style layer?
 
@@ -78,6 +114,37 @@ The closest portable layers are Kubernetes (portable runtime), Crossplane or you
 
 ## Architecture
 
+```mermaid
+flowchart LR
+    browser["Browser<br/>Angular SPA"] -- "HTTPS" --> cf["CloudFront<br/>one distribution"]
+    browser -- "login: InitiateAuth<br/>or Hosted UI + PKCE" --> cognito["Cognito<br/>User Pool"]
+    dev["local dev<br/>localhost:4200"] -. "direct call<br/>(CORS)" .-> api
+    cf -- "default behavior<br/>(cached)" --> s3[("S3 bucket<br/>index.html, bundles,<br/>runtime-config.json")]
+    cf -- "/api/* (not cached)" --> api
+    subgraph apigw ["API Gateway HTTP API"]
+        api["route<br/>GET /api/items"] --> authz["Cognito JWT<br/>authorizer"]
+    end
+    authz -. "checks token against" .-> cognito
+    authz -- "only if the JWT is valid" --> fn["Lambda<br/>Java 17, arm64, 512 MB"]
+    fn -- "Scan<br/>(IAM: grantReadData)" --> ddb[("DynamoDB items<br/>on-demand")]
+```
+
+The browser talks to two places only: **Cognito**, to log in and get a JWT, and **CloudFront**, for everything else.
+CloudFront serves the Angular files from S3 and forwards `/api/*` to API Gateway, so the frontend and the API share one origin and no CORS is needed in production.
+**API Gateway's JWT authorizer** checks the token before anything runs. An invalid token gets a `401` from the gateway, and the Lambda is never invoked, so `ItemsHandler` has no auth code at all.
+
+There is no VPC. Lambda and DynamoDB are both managed services reached over AWS's public APIs, and access is controlled by IAM (the function's role can only read the `items` table) rather than by network placement.
+The dashed line is local dev: `npm start` calls the deployed API Gateway directly, which is why the HTTP API allows CORS from `http://localhost:4200`.
+
+| Stack | Main resources | What it does here |
+|---|---|---|
+| **LambdaAuthStack** | Cognito User Pool, app client, Hosted UI domain `items-lambda-app` | Users, login flows, issuing JWTs. Self-signup is off. |
+| **LambdaDataStack** | DynamoDB table `items` (partition key `id`, on-demand billing), `AwsCustomResource` seed | Stores the items. The 8 seed rows are written once, when the stack is created. |
+| **LambdaBackendStack** | Lambda function (pre-built `items-lambda.jar`), HTTP API with one route, `HttpUserPoolAuthorizer` | Validates the JWT at the gateway, invokes the Lambda, allows CORS for local dev only. |
+| **LambdaFrontendStack** | Private S3 bucket (OAC), CloudFront distribution, 3 `BucketDeployment`s | Hosts the SPA, routes `/api/*` to the HTTP API, rewrites 403/404 to `index.html`, writes `runtime-config.json` from live CDK values. |
+
+**Code layout:**
+
 - **infra/** — AWS CDK (TypeScript), 4 stacks: `LambdaAuthStack` (Cognito), `LambdaDataStack` (DynamoDB table), `LambdaBackendStack` (Lambda behind an HTTP API), `LambdaFrontendStack` (S3 + CloudFront).
 - **backend/** — a single Java 17 Lambda function (no Spring Boot — see "Why no Spring Boot" below).
   - One route: `GET /api/items`, authorized by API Gateway's built-in Cognito JWT authorizer.
@@ -88,13 +155,14 @@ No signup UI exists on purpose — create a demo user manually (below).
 
 ### Why use CDK (Infrastructure as Code)?
 
-Rather than clicking through the AWS Console, this project's infrastructure is defined as TypeScript code (`infra/`).
-That gets you:
-
-- Standard programming constructs — loops, conditionals, variables, functions, unit tests, and shareable packages — applied to infrastructure, instead of hand-repeating console steps or fighting a templating language.
-- A reproducible environment:
-  - The same code deploys an identical stack every time.
-  - A bad manual click in the Console (or a bad deploy) is undone by just deploying the previous, known-good code again.
+> [!TIP]
+> Rather than clicking through the AWS Console, this project's infrastructure is defined as TypeScript code (`infra/`).
+> That gets you:
+>
+> - Standard programming constructs — loops, conditionals, variables, functions, unit tests, and shareable packages — applied to infrastructure, instead of hand-repeating console steps or fighting a templating language.
+> - A reproducible environment:
+>   - The same code deploys an identical stack every time.
+>   - A bad manual click in the Console (or a bad deploy) is undone by just deploying the previous, known-good code again.
 
 ### Identity & authentication (Cognito)
 
@@ -113,8 +181,9 @@ Lambda is suited to event-driven APIs, microservices, background task processors
 - Effectively unlimited, zero-management horizontal auto-scaling — no capacity to plan for.
 - Native event-driven execution — the platform invokes your code in response to a trigger (an HTTP request here, but equally an S3 upload, a queue message, a schedule).
 
-This is the opposite of a traditional fixed-cost, always-on server.
-No custom load balancing or VM fleet to manage in order to scale, and no custom background polling loop needed to catch events.
+> [!NOTE]
+> This is the opposite of a traditional fixed-cost, always-on server.
+> No custom load balancing or VM fleet to manage in order to scale, and no custom background polling loop needed to catch events.
 
 **Where Lambda sits in the broader compute-tier landscape:** the ECS+EC2 / ECS+Fargate comparison in the AWS-Fargate-App sample's README splits *orchestration* (ECS) from *compute* (EC2 or Fargate) as two separate layers.
 A different tier skips that split entirely — fully managed, high-level services with no separate orchestration layer to configure:
@@ -122,12 +191,14 @@ A different tier skips that split entirely — fully managed, high-level service
 - **AWS App Runner** (PaaS) — zero orchestrator setup; deploy from a Git repository or a Docker image in ECR; suited to web apps, REST APIs, and microservices.
 - **AWS Lambda** — can also deploy from a Docker container image in ECR, not just a zip; suited to event-driven APIs, background data processing, or ML model inference jobs.
 
-This project uses Lambda from this fully-managed tier, in contrast to the AWS-Fargate-App sample's ECS+Fargate choice from the orchestration+compute tier.
+> [!NOTE]
+> This project uses Lambda from this fully-managed tier, in contrast to the AWS-Fargate-App sample's ECS+Fargate choice from the orchestration+compute tier.
 
 ### CORS: needed locally, not in production
 
-- **Production**: CloudFront fronts both the frontend (S3) and backend (`/api/*` routed to the HTTP API) as behaviors on one distribution (`frontend-stack.ts`) — to the browser it's a single origin, so no CORS preflight ever happens.
-- **Local dev**: there's no local Lambda/API Gateway emulator (see the comparison table below), so local frontend dev calls the *real, deployed* HTTP API directly from `localhost:4200` — genuinely cross-origin. `backend-stack.ts`'s `HttpApi` therefore always configures `corsPreflight` for `http://localhost:4200`, even though production traffic never uses it.
+> [!TIP]
+> - **Production**: CloudFront fronts both the frontend (S3) and backend (`/api/*` routed to the HTTP API) as behaviors on one distribution (`frontend-stack.ts`) — to the browser it's a single origin, so no CORS preflight ever happens.
+> - **Local dev**: there's no local Lambda/API Gateway emulator (see the comparison table below), so local frontend dev calls the *real, deployed* HTTP API directly from `localhost:4200` — genuinely cross-origin. `backend-stack.ts`'s `HttpApi` therefore always configures `corsPreflight` for `http://localhost:4200`, even though production traffic never uses it.
 
 ### Why Lambda + DynamoDB, and what's actually different from the AWS-Fargate-App sample
 
@@ -148,9 +219,10 @@ The "no local emulator" row is the headline tradeoff this sample exists to surfa
 
 ### Why not Spring Boot on Lambda
 
-`aws-serverless-java-container` lets you run an unmodified Spring Boot app on Lambda, but Spring's classpath scanning and `ApplicationContext` startup add hundreds of milliseconds to every cold start — exactly the cost this sample is meant to make visible, not hide.
-A plain `RequestHandler<APIGatewayV2HTTPEvent, APIGatewayV2HTTPResponse>` with the DynamoDB SDK client held in a static field (reused across warm invocations) is the idiomatic lightweight shape for a Java Lambda.
-`Runtime.JAVA_17` + `Architecture.ARM_64` (Graviton) is the current recommended combination for cost and cold-start time.
+> [!WARNING]
+> `aws-serverless-java-container` lets you run an unmodified Spring Boot app on Lambda, but Spring's classpath scanning and `ApplicationContext` startup add hundreds of milliseconds to every cold start — exactly the cost this sample is meant to make visible, not hide.
+> A plain `RequestHandler<APIGatewayV2HTTPEvent, APIGatewayV2HTTPResponse>` with the DynamoDB SDK client held in a static field (reused across warm invocations) is the idiomatic lightweight shape for a Java Lambda.
+> `Runtime.JAVA_17` + `Architecture.ARM_64` (Graviton) is the current recommended combination for cost and cold-start time.
 
 ### DynamoDB and scalability
 
@@ -163,7 +235,8 @@ A plain `RequestHandler<APIGatewayV2HTTPEvent, APIGatewayV2HTTPResponse>` with t
 - High availability via multiple replicas.
 - Multiple database engines can front the same API/commands.
 
-All of this is extremely difficult to achieve with "classical" (relational, single-primary) database providers — which is exactly why RDS Postgres has no real equivalent to point to here, and why this sample pairs Lambda with DynamoDB rather than RDS.
+> [!IMPORTANT]
+> All of this is extremely difficult to achieve with "classical" (relational, single-primary) database providers — which is exactly why RDS Postgres has no real equivalent to point to here, and why this sample pairs Lambda with DynamoDB rather than RDS.
 
 ### Object storage (S3)
 
@@ -176,15 +249,16 @@ S3 never serves traffic directly here either — CloudFront sits in front of it 
 `cdk bootstrap` sets up the initial deployment infrastructure — a `CDKToolkit` CloudFormation stack (an S3 bucket for assets, an ECR repo, IAM roles).
 It's the small, one-time piece of AWS infrastructure CDK itself needs in order to deploy the rest of your desired infrastructure.
 
-**Never delete `CDKToolkit` intentionally:**
-- **S3 bucket takeover risk**
-  - If you delete its asset bucket, an attacker who knows your account ID and region could register that exact bucket name in their own account.
-  - If you later run `cdk deploy` without re-bootstrapping, your pipeline could try to publish deployment assets (e.g. Lambda code) straight into the attacker's bucket.
-- **Loss of asset history**
-  - That bucket holds zipped versions of previously deployed Lambda functions and CloudFormation templates.
-  - Deleting it wipes out that history, making rollback or inspecting older builds harder.
-
-For production, protect it with `cdk bootstrap --termination-protection`.
+> [!WARNING]
+> **Never delete `CDKToolkit` intentionally:**
+> - **S3 bucket takeover risk**
+>   - If you delete its asset bucket, an attacker who knows your account ID and region could register that exact bucket name in their own account.
+>   - If you later run `cdk deploy` without re-bootstrapping, your pipeline could try to publish deployment assets (e.g. Lambda code) straight into the attacker's bucket.
+> - **Loss of asset history**
+>   - That bucket holds zipped versions of previously deployed Lambda functions and CloudFormation templates.
+>   - Deleting it wipes out that history, making rollback or inspecting older builds harder.
+>
+> For production, protect it with `cdk bootstrap --termination-protection`.
 
 ### "Compiling" the deployment infrastructure
 
@@ -193,21 +267,23 @@ For production, protect it with `cdk bootstrap --termination-protection`.
 - `cdk diff` — also synthesizes, then asks CloudFormation to compute a change set against what's currently deployed.
   - This *does* talk to AWS, so it catches more (e.g. schema-level template validation).
 
-Neither one guarantees a successful deploy. AWS-side limits aren't coverable by CloudFormation's template schema, and only surface at actual deploy time:
-- Reserved words / naming rules
-- One-resource-per-parent constraints
-- Account/region quotas
-- Region-specific service or instance-type availability
-- IAM permission boundaries
-
-Nor do they guarantee your *application's* runtime behavior is correct — that's invisible to CDK at every stage, since it lives inside the running code, not the infrastructure.
-Both categories are only knowable by deploying and exercising the running system for real.
+> [!WARNING]
+> Neither one guarantees a successful deploy. AWS-side limits aren't coverable by CloudFormation's template schema, and only surface at actual deploy time:
+> - Reserved words / naming rules
+> - One-resource-per-parent constraints
+> - Account/region quotas
+> - Region-specific service or instance-type availability
+> - IAM permission boundaries
+>
+> Nor do they guarantee your *application's* runtime behavior is correct — that's invisible to CDK at every stage, since it lives inside the running code, not the infrastructure.
+> Both categories are only knowable by deploying and exercising the running system for real.
 
 ## Prerequisites
 
-Node 20+, npm, JDK 17, Maven, an AWS account + credentials configured.
-**No Docker Desktop needed** (no container images to build — contrast with the AWS-Fargate-App sample).
-The AWS CDK CLI does not need to be installed globally — `infra/package.json` scripts run it via `npx`.
+> [!NOTE]
+> Node 20+, npm, JDK 17, Maven, an AWS account + credentials configured.
+> **No Docker Desktop needed** (no container images to build — contrast with the AWS-Fargate-App sample).
+> The AWS CDK CLI does not need to be installed globally — `infra/package.json` scripts run it via `npx`.
 
 ### AWS credentials
 
@@ -221,7 +297,12 @@ aws iam attach-user-policy --user-name aws-sample-app-deployer --policy-arn arn:
 aws iam create-access-key --user-name aws-sample-app-deployer
 ```
 
-The last command prints an `AccessKeyId`/`SecretAccessKey` pair exactly once — copy both immediately.
+> [!WARNING]
+> `AdministratorAccess` is the simplest policy that lets CDK deploy everything, but it gives this user full control of the
+> account. Use it only in a personal sandbox account, and delete the access key (or the user) when you're done.
+
+> [!IMPORTANT]
+> The last command prints an `AccessKeyId`/`SecretAccessKey` pair exactly once — copy both immediately.
 
 Then configure a named CLI profile with them:
 
@@ -238,7 +319,8 @@ export AWS_PROFILE=aws-app-sample        # bash
 $env:AWS_PROFILE = "aws-app-sample"      # PowerShell
 ```
 
-**Stack names are prefixed `Lambda*`** (`LambdaAuthStack`, `LambdaDataStack`, `LambdaBackendStack`, `LambdaFrontendStack`) specifically so this app can be deployed into the *same* AWS account/region as the AWS-Fargate-App sample without colliding — CloudFormation identifies stacks by name within an account+region, not by which folder synthesized them.
+> [!NOTE]
+> **Stack names are prefixed `Lambda*`** (`LambdaAuthStack`, `LambdaDataStack`, `LambdaBackendStack`, `LambdaFrontendStack`) specifically so this app can be deployed into the *same* AWS account/region as the AWS-Fargate-App sample without colliding — CloudFormation identifies stacks by name within an account+region, not by which folder synthesized them.
 
 ## Build the Lambda jar
 
@@ -265,6 +347,10 @@ npx cdk deploy LambdaBackendStack       # needs backend/target/items-lambda.jar 
 
 Note `LambdaAuthStack`'s `UserPoolId`/`UserPoolClientId`/`CognitoDomain`/`IssuerUri` outputs and `LambdaBackendStack`'s `ApiUrl` output.
 
+> [!NOTE]
+> `LambdaDataStack` writes its 8 seed items only once, when the table is created. Editing `SEED_ITEMS` later changes
+> nothing until the stack is destroyed and re-deployed (see [Troubleshooting](#troubleshooting)).
+
 ### Create a demo user
 
 Self-signup is disabled (no signup feature exists).
@@ -286,7 +372,8 @@ aws cognito-idp admin-set-user-password \
 
 ## Local development
 
-There is no local backend to run (no Postgres, no `mvn spring-boot:run` equivalent) — the frontend talks straight to the deployed `LambdaBackendStack` API Gateway.
+> [!IMPORTANT]
+> There is no local backend to run (no Postgres, no `mvn spring-boot:run` equivalent) — the frontend talks straight to the deployed `LambdaBackendStack` API Gateway.
 
 1. Edit `frontend/public/runtime-config.json` with the real values from the stacks above:
    ```json
@@ -313,7 +400,8 @@ The AWS-Fargate-App sibling has a `docker-samples/` folder that runs its whole s
 - **This sample's backend is a Lambda function**, invoked by API Gateway. The closest local equivalent is the AWS Lambda Runtime Interface Emulator (RIE), but it exposes a raw `/2015-03-31/functions/function/invocations` invoke endpoint — not a normal `GET /api/items` route — so the frontend couldn't call it directly without a shim reproducing API Gateway's routing.
 - **Cognito JWT validation happens at API Gateway's `HttpUserPoolAuthorizer`, not in the Lambda.** `ItemsHandler` does zero auth checking itself (by design — see `infra/lib/backend-stack.ts`). A local container running just the Lambda would either skip auth entirely or need a second component reimplementing the authorizer, which is real added complexity rather than a Dockerfile exercise.
 
-DynamoDB itself *does* have a real official local image (`amazon/dynamodb-local`), so half of this stack is containerizable — it's specifically the Lambda + API Gateway + authorizer combination that has no faithful one-command local equivalent. This is the same point the "Local development" section above and the comparison table below make: **no local emulator** is a deliberate, load-bearing contrast between this sample and the Fargate one, not a gap to fill in.
+> [!NOTE]
+> DynamoDB itself *does* have a real official local image (`amazon/dynamodb-local`), so half of this stack is containerizable — it's specifically the Lambda + API Gateway + authorizer combination that has no faithful one-command local equivalent. This is the same point the "Local development" section above and the comparison table below make: **no local emulator** is a deliberate, load-bearing contrast between this sample and the Fargate one, not a gap to fill in.
 
 ## Full deploy
 
@@ -324,8 +412,9 @@ npx cdk diff
 npx cdk deploy --all
 ```
 
-First deploy takes a couple of minutes (no RDS/Fargate provisioning to wait on, unlike the other sample).
-Note `LambdaFrontendStack`'s `SiteUrl` output.
+> [!WARNING]
+> First deploy takes a couple of minutes (no RDS/Fargate provisioning to wait on, unlike the other sample).
+> Note `LambdaFrontendStack`'s `SiteUrl` output.
 
 ### Wire up the Hosted UI callback for the deployed site
 
@@ -338,7 +427,8 @@ export CLOUDFRONT_LOGOUT_URL="https://<your-cloudfront-domain>/login"
 npx cdk deploy LambdaAuthStack
 ```
 
-The production `runtime-config.json` is written automatically by `LambdaFrontendStack` from live CDK values — no manual edit needed there.
+> [!NOTE]
+> The production `runtime-config.json` is written automatically by `LambdaFrontendStack` from live CDK values — no manual edit needed there.
 
 ## End-to-end smoke test
 
@@ -346,6 +436,10 @@ The production `runtime-config.json` is written automatically by `LambdaFrontend
 2. Log in with the demo user via the default form — items list should load.
 3. Log out, log in again via "Sign in with Hosted UI" — same items list should load.
 4. Refresh directly on `/items` — should still work (CloudFront 404→`index.html` SPA rewrite).
+
+> [!TIP]
+> The first request after a few idle minutes takes a few seconds: that's a **cold start**, Lambda starting a new JVM.
+> Repeat the request and it's fast again (warm instance). Seeing this difference is one of the points of this sample.
 
 ## Automated E2E tests (Playwright)
 
@@ -359,5 +453,59 @@ cp .env.example .env              # fill in DEMO_USER_EMAIL / DEMO_USER_PASSWORD
 npm test
 ```
 
-`BASE_URL` defaults to `http://localhost:4200`.
-Set it to the `SiteUrl` output to test the deployed CloudFront site instead.
+> [!TIP]
+> `BASE_URL` defaults to `http://localhost:4200`.
+> Set it to the `SiteUrl` output to test the deployed CloudFront site instead.
+
+## Tear down
+
+> [!NOTE]
+> Everything here is billed per use (Lambda, API Gateway, on-demand DynamoDB, CloudFront), so an idle deployment costs
+> close to nothing. Destroy it anyway when you're done, so no public endpoint and no user pool stay behind.
+
+```bash
+cd infra
+npx cdk destroy --all
+```
+
+This deletes `LambdaFrontendStack`, `LambdaBackendStack`, `LambdaDataStack` and `LambdaAuthStack`. Their resources use
+`RemovalPolicy.DESTROY`, so the DynamoDB table, the S3 site bucket (emptied automatically) and the Cognito user pool are
+removed too, along with all data in them.
+
+What stays:
+- **`CDKToolkit`** (from `cdk bootstrap`): keep it, see [CDK Bootstrap](#cdk-bootstrap). Its asset bucket still holds the
+  uploaded Lambda jar.
+- Anything CDK doesn't delete by default, such as the Lambda's CloudWatch log group. Check CloudWatch Logs in the
+  console if you want the account fully clean.
+
+## Troubleshooting
+
+| Symptom | Fix |
+|---|---|
+| `401 Unauthorized` from `/api/items`, and nothing in the Lambda's logs | The gateway's authorizer rejected the token before the Lambda ran, so the cause is never in `ItemsHandler`. Check that the token comes from the User Pool and app client in `runtime-config.json` and hasn't expired. |
+| `cdk deploy` fails because `backend/target/items-lambda.jar` can't be found | Build it first: `cd backend && mvn package`. `LambdaBackendStack` uploads the pre-built jar; it doesn't build anything itself. |
+| A backend code change has no effect | There's no local backend. Every change needs `mvn package` and then `npx cdk deploy LambdaBackendStack`. |
+| Editing `SEED_ITEMS` in `data-stack.ts` changes nothing | The seed only runs when the table is created. Destroy and re-deploy `LambdaDataStack`, or add an `onUpdate` handler. |
+| CORS error during local dev | `apiBaseUrl` must be the deployed `<ApiUrl>/api`, and the dev server must be on exactly `http://localhost:4200`. The HTTP API only allows that origin and `GET`. |
+| The first request after a while takes a few seconds | A cold start: Lambda is starting a new JVM. Later requests reuse the warm instance. This is the cost the sample exists to show. |
+| `mvn package` fails with `PKIX path building failed` | An antivirus or proxy is intercepting HTTPS with its own root CA. Import that CA into a copy of the JDK's `cacerts` (see `CLAUDE.md` in `AWS-Fargate-App`). |
+| A stack deploy updates the wrong app's resources | CloudFormation identifies stacks by name. Keep the `Lambda*` prefix so these stacks never collide with the `Fargate*` ones in the same account and region. |
+| Cognito rejects the Hosted UI domain prefix | Domain prefixes can't contain the word `aws`. Keep a prefix like `items-lambda-app`. |
+| Hosted UI shows `redirect_mismatch` on the deployed site | `LambdaAuthStack` still only allows `localhost` callbacks. Re-deploy it with `CLOUDFRONT_CALLBACK_URL` / `CLOUDFRONT_LOGOUT_URL` set ([Wire up the Hosted UI callback](#wire-up-the-hosted-ui-callback-for-the-deployed-site)). |
+| AWS CLI / CDK: `ExpiredToken` or `Unable to locate credentials` | Set the profile for the session: `export AWS_PROFILE=aws-app-sample` (bash) or `$env:AWS_PROFILE = "aws-app-sample"` (PowerShell). |
+| Playwright: `net::ERR_NETWORK_ACCESS_DENIED` | Not a TLS problem, so `ignoreHTTPSErrors` won't help. A firewall or antivirus is blocking the freshly downloaded Chromium: allow `chrome.exe` under `%LOCALAPPDATA%\ms-playwright\`. |
+| E2E tests don't see `DEMO_USER_EMAIL` / `DEMO_USER_PASSWORD` | Run them with `npm test`, which loads `.env` through `node --env-file`. Plain `npx playwright test` skips it. |
+
+---
+
+## Further reading
+
+- AWS CDK: [Developer guide](https://docs.aws.amazon.com/cdk/v2/guide/home.html) · [Bootstrapping](https://docs.aws.amazon.com/cdk/v2/guide/bootstrapping.html) · [`AwsCustomResource`](https://docs.aws.amazon.com/cdk/api/v2/docs/aws-cdk-lib.custom_resources.AwsCustomResource.html) · [CDK API reference](https://docs.aws.amazon.com/cdk/api/v2/)
+- Lambda: [Building Lambda functions with Java](https://docs.aws.amazon.com/lambda/latest/dg/lambda-java.html) · [Execution environment lifecycle (cold starts)](https://docs.aws.amazon.com/lambda/latest/dg/lambda-runtime-environment.html) · [SnapStart](https://docs.aws.amazon.com/lambda/latest/dg/snapstart.html) · [Arm64 (Graviton) functions](https://docs.aws.amazon.com/lambda/latest/dg/foundation-arch.html)
+- API Gateway: [HTTP APIs](https://docs.aws.amazon.com/apigateway/latest/developerguide/http-api.html) · [JWT authorizers](https://docs.aws.amazon.com/apigateway/latest/developerguide/http-api-jwt-authorizer.html) · [CORS for HTTP APIs](https://docs.aws.amazon.com/apigateway/latest/developerguide/http-api-cors.html)
+- DynamoDB: [Core components](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/HowItWorks.CoreComponents.html) · [On-demand capacity](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/on-demand-capacity-mode.html) · [Best practices for data modeling](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/best-practices.html)
+- Frontend delivery: [CloudFront with an S3 origin (OAC)](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/private-content-restricting-access-to-s3.html) · [CloudFront cache behaviors](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/distribution-web-values-specify.html)
+- Identity: [Cognito User Pools](https://docs.aws.amazon.com/cognito/latest/developerguide/cognito-user-pools.html) · [OAuth 2.0 PKCE (RFC 7636)](https://datatracker.ietf.org/doc/html/rfc7636)
+- Local emulation (deliberately not used here): [AWS SAM CLI](https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/using-sam-cli.html) · [DynamoDB local](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/DynamoDBLocal.html)
+- Testing: [Playwright](https://playwright.dev/docs/intro)
+- Sibling project: `AWS-Fargate-App`, the same app on ECS Fargate + ALB + RDS Postgres
